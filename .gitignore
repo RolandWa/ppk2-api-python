@@ -3,3 +3,5 @@ src/ppk2_api.egg-info
 build
 dist!/.gitignore
 .idea
+*.csv
+/src/ppk2_api_python.egg-info/*
