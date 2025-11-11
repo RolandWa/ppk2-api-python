@@ -50,8 +50,8 @@ class PPK2Adapter:
 
 
 # --- MOCK DEFINITIONS (Always available for fallback) ---
-BASE_I_QUIET = 10.0  # Static base for quiet current (mA)
-BASE_I_PEAK = 130.0  # Static base for peak current (mA)
+BASE_I_QUIET = 1.0  # Static base for quiet current (mA)
+BASE_I_PEAK = 100.0  # Static base for peak current (mA)
 NOISE_RANGE = 0.5  # Random fluctuation range (±0.5 mA)
 
 
@@ -245,8 +245,8 @@ def init_ppk2_device(voltage_v, samplerate_hz, logic_enabled=False, spike_filter
 # EMULATION CONSTANTS AND BATTERY PARAMETERS
 # ----------------------------------------------------------------------
 
-DISCHARGE_RATE = 100  # Emulation acceleration factor (100x faster than real time)
-TIME_STEP_REAL_SEC = 1.0  # The amount of real time simulated in one emulation step
+DISCHARGE_RATE = 1  # Emulation acceleration factor (100x faster than real time)
+TIME_STEP_REAL_SEC = 0.1  # The amount of real time simulated in one emulation step
 TIME_STEP_EMUL_SEC = TIME_STEP_REAL_SEC / DISCHARGE_RATE  # The actual time the PPK2 samples current
 
 
@@ -297,6 +297,8 @@ class BatteryEmulator(tk.Frame):
 		self.spike_filtering_var = tk.BooleanVar(value=False)  # <--- NEW VAR
 		self.sim_discharge_var = tk.BooleanVar(value=False)
 		self.sim_time_str_var = tk.StringVar(value=self.SIM_TIME_DEFAULT_STR)
+		# --- NEW VARIABLE for Discharge Curve Mode ---
+		self.linear_discharge_var = tk.BooleanVar(value=False)
 
 		# Bind voltage variable changes to update the config
 		self.v_start_var.trace_add("write", self.update_config_voltage)
@@ -470,6 +472,9 @@ class BatteryEmulator(tk.Frame):
 		ttk.Entry(sim_frame, textvariable=self.sim_time_str_var, width=8).pack(side='left', padx=5, pady=2)
 		ttk.Label(sim_frame, text=f"({self.SIM_TIME_DEFAULT_STR} default)").pack(side='left', padx=5, pady=2)
 
+		# --- NEW Linear Slope Checkbutton ---
+		ttk.Checkbutton(sim_frame, text="Test Mode: Linear V-SoC Curve", variable=self.linear_discharge_var, style='TCheckbutton').pack(side='left', padx=15, pady=2)
+
 		# --- STATE DISPLAY FRAME ---
 		state_frame = ttk.LabelFrame(self.master, text="Simulation State")
 		state_frame.pack(padx=10, pady=5, fill="x")
@@ -541,7 +546,9 @@ class BatteryEmulator(tk.Frame):
 			)
 
 			# Update the title in case the mode changed to MOCK
-			self.master.title(f"PPK2 [{API_MODE}] - Battery Simulator and Current Profiler")
+			mode = "TIME SIMULATION" if self.sim_discharge_var.get() else "CURRENT EMULATION"
+			curve_mode = "Linear (Test)" if self.linear_discharge_var.get() else "S-Curve (Real)"
+			self.master.title(f"PPK2 [{API_MODE}] - Battery Simulator ({mode} / {curve_mode})")
 
 			# 2. Reset State and Logs
 			self.all_current_samples = []
@@ -558,14 +565,15 @@ class BatteryEmulator(tk.Frame):
 			self.data_thread.start()
 
 			# Initial console debug message
+			curve_mode = "Linear Slope (Test Mode)" if self.linear_discharge_var.get() else "S-Curve (Real Mode)"
 			print("\n--- EMULATION STARTING ---")
 			print(
-				f"Mode: {'Time Simulation' if self.sim_discharge_var.get() else 'Current Emulation'} | Battery: {self.battery_type_var.get()}")
+				f"Mode: {'Time Simulation' if self.sim_discharge_var.get() else 'Current Emulation'} | Curve: {curve_mode} | Battery: {self.battery_type_var.get()}")
 			print(
 				f"Capacity: {self.config['CAPACITY_NOMINAL_MAH']} mAh | V_Start: {self.config['V_START']} V | V_Stop: {self.config['V_STOP']} V")
 			if self.sim_discharge_var.get():
 				print(
-					f"Target Discharge Time: {self.sim_time_str_var.get()} (MM:SS) | Required Loss Rate: {self.required_mah_loss_per_sec * 3600.0:.2f} mA (Theoretical)")
+					f"Target Discharge Time: {self.sim_time_str_var.get()} (MM:SS) | Required Loss Rate: {self.required_mah_loss_per_sec * 3600.0:.2f} mA / sec (Theoretical)")
 			print("--------------------------")
 
 		except Exception as e:
@@ -593,58 +601,97 @@ class BatteryEmulator(tk.Frame):
 
 	# --- Voltage/SoC Mapping Functions (Retained from original script) ---
 	def get_voltage_from_soc(self, soc_percent):
-		"""Calculates voltage from SoC percentage based on simplified discharge curve."""
+		"""Calculates voltage from SoC percentage based on simplified discharge curve or linear slope."""
 		V_start = self.config["V_START"]
 		V_stop = self.config["V_STOP"]
-		if V_start <= V_stop:
-			return V_start
+
+		# Failsafe
+		if V_start <= V_stop: return V_start
+		if soc_percent >= 100: return V_start
+		if soc_percent <= 0: return V_stop
+
 		V_range = V_start - V_stop
 
-		if soc_percent >= 90:
-			V_drop_10_percent = V_range * 0.1
-			V_current = V_start - ((100 - soc_percent) * (V_drop_10_percent / 10))
-			return max(V_stop, V_current)
-		elif soc_percent > 10:
-			V_plateau_start = V_start - (V_range * 0.1)
-			V_plateau_end = V_stop + (V_range * 0.1)
+		# --- TEST MODE: Linear Slope (Rampa Liniowa) ---
+		# Ten tryb jest poprawnie odwzorowany w poprzednim skrypcie i pozostaje liniowy:
+		# Napięcie skaluje się liniowo od V_stop do V_start.
+		if self.sim_discharge_var.get():
+			soc_ratio = soc_percent / 100.0
+			V_current = V_stop + (V_range * soc_ratio)
+			return V_current
+
+		# --- REAL EMULATION MODE: Simplified S-Curve (Krzywa S) ---
+		# Uproszczona S-krzywa z dokładniejszym odwzorowaniem plateau i "kolana".
+
+		# 1. Górny zakres (100% - 90%): Szybki spadek po naładowaniu.
+		if soc_percent > 90:
+			# Spadek o 10% V_range następuje w górnych 10% SoC
+			V_drop_initial = V_range * 0.1
+			V_current = V_start - ((100 - soc_percent) * (V_drop_initial / 10))
+			return V_current
+
+		# 2. Plateau (90% - 20%): Bardzo płaski, liniowy spadek (70% zakresu SoC).
+		elif soc_percent > 20:
+			V_plateau_start = V_start - (V_range * 0.1)  # Napięcie przy 90% SoC
+			V_plateau_end = V_stop + (V_range * 0.2)  # Napięcie przy 20% SoC (wyższe niż poprzednio)
+
 			V_plateau_drop = V_plateau_start - V_plateau_end
-			V_current = V_plateau_start - ((90 - soc_percent) * (V_plateau_drop / 80))
-			return max(V_stop, V_current)
+
+			# Skalowanie na 70% zakresu (90 - 20 = 70)
+			V_current = V_plateau_start - ((90 - soc_percent) * (V_plateau_drop / 70))
+			return V_current
+
+		# 3. Dolny zakres (20% - 0%): Gwałtowne "kolano" (knee) (20% zakresu SoC).
 		else:
-			V_plateau_end = V_stop + (V_range * 0.1)
-			V_current = V_stop + (soc_percent * (V_plateau_end - V_stop) / 10)
-			return max(V_stop, V_current)
+			V_plateau_end = V_stop + (V_range * 0.2)  # Napięcie przy 20% SoC
+
+			# Skalowanie na 20% zakresu
+			V_current = V_stop + (soc_percent * (V_plateau_end - V_stop) / 20)
+			return V_current
 
 	def get_soc_percent_from_voltage(self, voltage):
 		"""Reverse calculation: Estimates SoC from voltage (used for setup)."""
 		V_start = self.config["V_START"]
 		V_stop = self.config["V_STOP"]
-		if V_start <= V_stop:
-			return 100.0
-		V_range = V_start - V_stop
-		if voltage >= V_start:
-			return 100.0
-		elif voltage <= V_stop:
-			return 0.0
 
-		# Simplified inverse mapping
+		if V_start <= V_stop: return 100.0
+
+		if voltage >= V_start: return 100.0
+		if voltage <= V_stop: return 0.0
+
+		V_range = V_start - V_stop
+
+		# --- TEST MODE: Linear Slope (Rampa Liniowa) - SPRAWDZONA POPRAWNOŚĆ ---
+		if self.sim_discharge_var.get():
+			# W trybie liniowym, SoC jest prostą funkcją liniową napięcia.
+			voltage_drop = voltage - V_stop
+			soc_percent = (voltage_drop / V_range) * 100.0
+			return max(0.0, min(100.0, soc_percent))
+
+		# --- REAL EMULATION MODE: Simplified S-Curve (Krzywa S) ---
+
 		V_drop_10_percent = V_range * 0.1
 		V_plateau_start = V_start - V_drop_10_percent
-		if voltage > V_plateau_start:
-			# Top 10%
-			return 100 - ((V_start - voltage) / V_drop_10_percent) * 10
+		V_plateau_end = V_stop + V_range * 0.2  # Nowa granica plateau
 
-		V_plateau_end = V_stop + V_drop_10_percent
-		if voltage >= V_plateau_end:
-			# Middle 80%
+		# 1. Górny zakres (100% - 90%)
+		if voltage > V_plateau_start:
+			# Używamy napięcia V_start i V_plateau_start (drop_10) do interpolacji w zakresie 10% SoC.
+			return 100.0 - ((V_start - voltage) / V_drop_10_percent) * 10.0
+
+		# 2. Dolny zakres (0% - 20%) - Najpierw sprawdzamy "kolano", bo jest najbardziej strome.
+		if voltage < V_plateau_end:
+			V_final_range = V_plateau_end - V_stop
+			if V_final_range <= 0: return 20.0
+			# Interpolacja w zakresie 20% SoC.
+			return ((voltage - V_stop) / V_final_range) * 20.0
+
+		# 3. Plateau (20% - 90%)
+		else:
 			V_plateau_drop = V_plateau_start - V_plateau_end
 			if V_plateau_drop <= 0: return 90.0
-			return 90 - ((V_plateau_start - voltage) / V_plateau_drop) * 80
-
-		# Bottom 10%
-		V_final_range = V_plateau_end - V_stop
-		if V_final_range <= 0: return 10.0
-		return ((voltage - V_stop) / V_final_range) * 10
+			# Interpolacja w zakresie 70% SoC.
+			return 90.0 - ((V_plateau_start - voltage) / V_plateau_drop) * 70.0
 
 	# --- Main Emulation Loop ---
 	def emulation_loop(self):
@@ -752,6 +799,7 @@ class BatteryEmulator(tk.Frame):
 					f"V_OUT: {self.current_voltage:.3f} V | "
 					f"I_AVG: {I_avg_ma_realtime:.2f} mA | "
 					f"SoC: {soc_percent:.1f}% | "
+					f"Linear_Discharge: {self.linear_discharge_var.get()}  | "
 					f"Rem. Time: {time_rem_str}"
 				)
 
@@ -783,6 +831,10 @@ class BatteryEmulator(tk.Frame):
 		# Update Statistics
 		self.peak_label.config(text=f"Peak Current (mA): {peak_current:.2f}")
 		self.rms_label.config(text=f"RMS Current (mA): {rms_current:.2f}")
+
+		mode = "TIME SIMULATION" if self.sim_discharge_var.get() else "CURRENT EMULATION"
+		curve_mode = "Linear (Test)" if self.linear_discharge_var.get() else "S-Curve (Real)"
+		self.master.title(f"PPK2 [{API_MODE}] - Battery Simulator ({mode} / {curve_mode})")
 
 		# Update Plot (Only plot last ~1000 samples for performance)
 		plot_limit = 1000
@@ -830,9 +882,11 @@ class BatteryEmulator(tk.Frame):
 			initial_soc = self.get_soc_percent_from_voltage(self.config["V_START"])
 			soc_drop = initial_soc - final_soc
 			mah_consumed_simulated = self.config["CAPACITY_NOMINAL_MAH"] * (soc_drop / 100.0)
+			I_test_avg_ma = mah_consumed_simulated / total_time_real_h if total_time_real_h > 0 else 0
 
 			final_message = (
 				f"!!! SIMULATION FINISHED (Time Mode) !!!\n"
+				f"Curve Mode: {'Linear Slope' if self.linear_discharge_var.get() else 'Real S-Curve'}\n"
 				f"Targeted simulation time: {self.sim_time_str_var.get()} (MM:SS).\n"
 				f"Discharge from {self.config['V_START']:.2f}V to {self.config['V_STOP']:.2f}V achieved.\n"
 				f"\n--- RESULTS ---\n"
@@ -842,8 +896,8 @@ class BatteryEmulator(tk.Frame):
 			)
 		else:
 			total_consumed_mah = self.config["CAPACITY_NOMINAL_MAH"] - self.current_capacity_mah
-			estimated_runtime_h = self.config["CAPACITY_NOMINAL_MAH"] / I_test_avg_ma if I_test_avg_ma > 0 else float(
-				'inf')
+			I_test_avg_ma = total_consumed_mah / total_time_real_h if total_time_real_h > 0 else 0
+			estimated_runtime_h = self.config["CAPACITY_NOMINAL_MAH"] / I_test_avg_ma if I_test_avg_ma > 0 else float('inf')
 			estimated_runtime_hms = self.format_seconds_to_hms(estimated_runtime_h * 3600.0)
 
 			final_message = (
@@ -915,27 +969,36 @@ class BatteryEmulator(tk.Frame):
 		I_peak_ma = np.max(all_currents_np) if all_currents_np.size > 0 else 0.0
 
 		if self.sim_discharge_var.get():
+			# Time Simulation Mode
 			# In time mode, we calculate the charge loss required to hit V_STOP based on the SoC curve.
 			final_soc = self.get_soc_percent_from_voltage(self.config["V_STOP"])
 			initial_soc = self.get_soc_percent_from_voltage(self.config["V_START"])
 			soc_drop = initial_soc - final_soc
 			mah_consumed_simulated = self.config["CAPACITY_NOMINAL_MAH"] * (soc_drop / 100.0)
 			I_test_avg_ma_realtime = mah_consumed_simulated / total_time_real_h if total_time_real_h > 0 else 0
-			estimated_runtime_hms = "N/A"  # Not applicable in time mode
+			I_peak_ma = np.max(self.all_current_samples) if self.all_current_samples else 0
+
+			total_coulomb_uAh = mah_consumed_simulated * 1000
+			estimated_runtime_hms = self.format_seconds_to_hms(self.total_sim_time_sec)
+			runtime_status = f"Targeted Runtime (H:M:S): {estimated_runtime_hms}"
 
 		else:
+			# Current Emulation Mode
 			total_consumed_mah = self.config["CAPACITY_NOMINAL_MAH"] - self.current_capacity_mah
-			I_test_avg_ma_realtime = total_consumed_mah / total_time_real_h if total_time_real_h > 0 else 0
-			estimated_runtime_h = self.config[
-				                      "CAPACITY_NOMINAL_MAH"] / I_test_avg_ma_realtime if I_test_avg_ma_realtime > 0 else float(
-				'inf')
+			I_avg_ma = total_consumed_mah / total_time_real_h if total_time_real_h > 0 else 0
+			I_peak_ma = np.max(self.all_current_samples) if self.all_current_samples else 0
+
+			total_coulomb_uAh = total_consumed_mah * 1000
+			estimated_runtime_h = self.config["CAPACITY_NOMINAL_MAH"] / I_avg_ma if I_avg_ma > 0 else float('inf')
 			estimated_runtime_hms = self.format_seconds_to_hms(estimated_runtime_h * 3600.0)
+			runtime_status = f"Estimated Total Runtime (H:M:S): {estimated_runtime_hms}"
 
 		# --- 5. Create Summary Block ---
 		summary_lines = [
 			"--------------------------",
 			"--- EMULATION SUMMARY ---",
 			f"API_Mode,{API_MODE}",
+			f"Curve_Mode,{'LINEAR_SLOPE_TEST' if self.linear_discharge_var.get() else 'REAL_S_CURVE'}",
 			f"Battery_Type,{self.battery_type_var.get()}",
 			f"Capacity_mAh,{self.config['CAPACITY_NOMINAL_MAH']}",
 			f"Discharge_Mode,{'Time Simulation' if self.sim_discharge_var.get() else 'Current Emulation'}",
