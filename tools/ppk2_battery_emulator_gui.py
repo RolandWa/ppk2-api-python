@@ -2,9 +2,6 @@ import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 import threading
 import time
-import math
-import pandas as pd
-import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import numpy as np
 import random
@@ -50,9 +47,9 @@ class PPK2Adapter:
 
 
 # --- MOCK DEFINITIONS (Always available for fallback) ---
-BASE_I_QUIET = 1.0  # Static base for quiet current (mA)
-BASE_I_PEAK = 100.0  # Static base for peak current (mA)
-NOISE_RANGE = 0.5  # Random fluctuation range (±0.5 mA)
+BASE_I_QUIET = 50.0  # Static base for quiet current (mA)
+BASE_I_PEAK = 2000.0  # Static base for peak current (mA)
+NOISE_RANGE = 2.5  # Random fluctuation range (±0.5 mA)
 
 
 class PPK2Mock(PPK2Adapter):
@@ -245,8 +242,8 @@ def init_ppk2_device(voltage_v, samplerate_hz, logic_enabled=False, spike_filter
 # EMULATION CONSTANTS AND BATTERY PARAMETERS
 # ----------------------------------------------------------------------
 
-DISCHARGE_RATE = 1  # Emulation acceleration factor (100x faster than real time)
-TIME_STEP_REAL_SEC = 0.1  # The amount of real time simulated in one emulation step
+DISCHARGE_RATE = 100  # Emulation acceleration factor (100x faster than real time)
+TIME_STEP_REAL_SEC = 0.5  # The amount of real time simulated in one emulation step
 TIME_STEP_EMUL_SEC = TIME_STEP_REAL_SEC / DISCHARGE_RATE  # The actual time the PPK2 samples current
 
 
@@ -297,7 +294,6 @@ class BatteryEmulator(tk.Frame):
 		self.spike_filtering_var = tk.BooleanVar(value=False)  # <--- NEW VAR
 		self.sim_discharge_var = tk.BooleanVar(value=False)
 		self.sim_time_str_var = tk.StringVar(value=self.SIM_TIME_DEFAULT_STR)
-		# --- NEW VARIABLE for Discharge Curve Mode ---
 		self.linear_discharge_var = tk.BooleanVar(value=False)
 
 		# Bind voltage variable changes to update the config
@@ -404,19 +400,24 @@ class BatteryEmulator(tk.Frame):
 		if self.sim_discharge_var.get():
 			self.total_sim_time_sec = self.convert_mm_ss_to_sec(self.sim_time_str_var.get())
 
-			# --- Calculation for console/summary output (not used for V drop) ---
-			soc_start = 100.0
-			sim_V_stop = max(self.config["V_STOP"], self.config["V_START"] - 0.01)
-			soc_stop = self.get_soc_percent_from_voltage(sim_V_stop)
+			# --- Calculation for Sim Discharge Mode (Linear SoC loss in time) ---
+			# In time simulation mode, we calculate the required mAh drop from V_START's SoC to V_STOP's SoC.
+			# We use the S-curve logic here (by passing V_START/V_STOP to get_soc_percent_from_voltage
+			# while it is running in its *internal* S-curve mode by default, UNLESS we force linear V-SoC in the function).
+			# Here, we use a simple 100% to 0% drop to ensure the entire capacity is used for linear time discharge.
+			soc_start = 100.0  # Start at 100%
+			soc_stop = 0.0  # Finish at 0%
 
-			required_soc_drop = soc_start - soc_stop
+			required_soc_drop = soc_start - soc_stop  # 100%
 			required_mah_drop = required_soc_drop * (self.config["CAPACITY_NOMINAL_MAH"] / 100.0)
 
 			if self.total_sim_time_sec > 0:
+				# This is the linear rate of capacity loss per real second of emulation
 				self.required_mah_loss_per_sec = required_mah_drop / self.total_sim_time_sec
 			else:
 				self.required_mah_loss_per_sec = 0
 
+			# Set initial capacity to nominal
 			self.current_capacity_mah = self.config["CAPACITY_NOMINAL_MAH"]
 
 	def create_widgets(self):
@@ -472,7 +473,6 @@ class BatteryEmulator(tk.Frame):
 		ttk.Entry(sim_frame, textvariable=self.sim_time_str_var, width=8).pack(side='left', padx=5, pady=2)
 		ttk.Label(sim_frame, text=f"({self.SIM_TIME_DEFAULT_STR} default)").pack(side='left', padx=5, pady=2)
 
-		# --- NEW Linear Slope Checkbutton ---
 		ttk.Checkbutton(sim_frame, text="Test Mode: Linear V-SoC Curve", variable=self.linear_discharge_var, style='TCheckbutton').pack(side='left', padx=15, pady=2)
 
 		# --- STATE DISPLAY FRAME ---
@@ -491,7 +491,7 @@ class BatteryEmulator(tk.Frame):
 		ttk.Label(logic_status_frame, text="Logic Pins:").pack(side='left', padx=5)
 		self.logic_indicators = []
 		for i in range(8):
-			label = ttk.Label(logic_status_frame, text=f"D{i}: LOW", width=6)
+			label = ttk.Label(logic_status_frame, text=f"D{i}: LOW", width=9, anchor='w')
 			label.pack(side='left', padx=2)
 			self.logic_indicators.append(label)
 
@@ -539,7 +539,7 @@ class BatteryEmulator(tk.Frame):
 
 			# 1. Initialize PPK2 using the unified function
 			self.ppk2 = init_ppk2_device(
-				self.config["V_START"],
+				self.current_voltage,  # Use the voltage set in load_initial_state
 				self.config["SAMPLE_RATE_HZ"],
 				self.logic_enabled_var.get(),
 				self.spike_filtering_var.get()  # <--- PASS NEW ARGUMENT
@@ -588,13 +588,18 @@ class BatteryEmulator(tk.Frame):
 
 		if self.ppk2:
 			try:
-				self.ppk2.stop()  # Calls unified stop method
+				# We do not need the real stop() for mock, but keep it structured
+				if API_MODE == "REAL":
+					self.ppk2.stop() # Uncomment for real API
+					pass
+				else:
+					self.ppk2.stop()  # Mock stop
 			except Exception as e:
 				print(f"Error while stopping PPK2 device: {e}")
 			self.ppk2 = None
 
 		if self.data_thread and self.data_thread.is_alive():
-			self.data_thread.join(timeout=2)
+			self.data_thread.join(timeout=0.1)
 
 		self.start_button.config(text="START Emulation", state=tk.NORMAL)
 		self.display_final_results()
@@ -612,43 +617,40 @@ class BatteryEmulator(tk.Frame):
 
 		V_range = V_start - V_stop
 
-		# --- TEST MODE: Linear Slope (Rampa Liniowa) ---
-		# Ten tryb jest poprawnie odwzorowany w poprzednim skrypcie i pozostaje liniowy:
-		# Napięcie skaluje się liniowo od V_stop do V_start.
-		if self.sim_discharge_var.get():
+		# --- TEST MODE: Linear Slope (Linear Ramp) ---
+		# activated by setting 'Simulated Time Discharge'
+		if self.linear_discharge_var.get():
 			soc_ratio = soc_percent / 100.0
 			V_current = V_stop + (V_range * soc_ratio)
 			return V_current
 
-		# --- REAL EMULATION MODE: Simplified S-Curve (Krzywa S) ---
-		# Uproszczona S-krzywa z dokładniejszym odwzorowaniem plateau i "kolana".
-
-		# 1. Górny zakres (100% - 90%): Szybki spadek po naładowaniu.
+		# --- REAL EMULATION MODE: Simplified S-Curve---
+		# 1. Top range (100% - 90%): fast slope after charge
 		if soc_percent > 90:
-			# Spadek o 10% V_range następuje w górnych 10% SoC
 			V_drop_initial = V_range * 0.1
 			V_current = V_start - ((100 - soc_percent) * (V_drop_initial / 10))
 			return V_current
 
-		# 2. Plateau (90% - 20%): Bardzo płaski, liniowy spadek (70% zakresu SoC).
+		# 2. Plateau (90% - 20%): flat one, at the end a slow down slope (70% of SoC range).
 		elif soc_percent > 20:
-			V_plateau_start = V_start - (V_range * 0.1)  # Napięcie przy 90% SoC
-			V_plateau_end = V_stop + (V_range * 0.2)  # Napięcie przy 20% SoC (wyższe niż poprzednio)
+			V_plateau_start = V_start - (V_range * 0.1)
+			V_plateau_end = V_stop + (V_range * 0.2)
 
 			V_plateau_drop = V_plateau_start - V_plateau_end
 
-			# Skalowanie na 70% zakresu (90 - 20 = 70)
+			# scale to 70% (90 - 20 = 70)
 			V_current = V_plateau_start - ((90 - soc_percent) * (V_plateau_drop / 70))
 			return V_current
 
-		# 3. Dolny zakres (20% - 0%): Gwałtowne "kolano" (knee) (20% zakresu SoC).
+		# 3. Low range (20% - 0%): (knee) (last of 20% SoC).
 		else:
-			V_plateau_end = V_stop + (V_range * 0.2)  # Napięcie przy 20% SoC
+			V_plateau_end = V_stop + (V_range * 0.2)
 
-			# Skalowanie na 20% zakresu
+			# scale on the 20% range
 			V_current = V_stop + (soc_percent * (V_plateau_end - V_stop) / 20)
 			return V_current
 
+	# --- Voltage/SoC Mapping Functions (Retained from original script) ---
 	def get_soc_percent_from_voltage(self, voltage):
 		"""Reverse calculation: Estimates SoC from voltage (used for setup)."""
 		V_start = self.config["V_START"]
@@ -661,111 +663,95 @@ class BatteryEmulator(tk.Frame):
 
 		V_range = V_start - V_stop
 
-		# --- TEST MODE: Linear Slope (Rampa Liniowa) - SPRAWDZONA POPRAWNOŚĆ ---
-		if self.sim_discharge_var.get():
-			# W trybie liniowym, SoC jest prostą funkcją liniową napięcia.
+		# --- TEST MODE: Linear Slope ---
+		if self.linear_discharge_var.get():
+			# Linear mode - linear function.
 			voltage_drop = voltage - V_stop
 			soc_percent = (voltage_drop / V_range) * 100.0
 			return max(0.0, min(100.0, soc_percent))
 
-		# --- REAL EMULATION MODE: Simplified S-Curve (Krzywa S) ---
-
+		# --- REAL EMULATION MODE: Simplified S-Curve --
 		V_drop_10_percent = V_range * 0.1
 		V_plateau_start = V_start - V_drop_10_percent
-		V_plateau_end = V_stop + V_range * 0.2  # Nowa granica plateau
+		V_plateau_end = V_stop + V_range * 0.2  # New boundary of plateau
 
-		# 1. Górny zakres (100% - 90%)
+		# 1. High range (100% - 90%)
 		if voltage > V_plateau_start:
-			# Używamy napięcia V_start i V_plateau_start (drop_10) do interpolacji w zakresie 10% SoC.
 			return 100.0 - ((V_start - voltage) / V_drop_10_percent) * 10.0
 
-		# 2. Dolny zakres (0% - 20%) - Najpierw sprawdzamy "kolano", bo jest najbardziej strome.
+		# 2. Low range (0% - 20%)
 		if voltage < V_plateau_end:
 			V_final_range = V_plateau_end - V_stop
 			if V_final_range <= 0: return 20.0
-			# Interpolacja w zakresie 20% SoC.
 			return ((voltage - V_stop) / V_final_range) * 20.0
 
 		# 3. Plateau (20% - 90%)
 		else:
 			V_plateau_drop = V_plateau_start - V_plateau_end
 			if V_plateau_drop <= 0: return 90.0
-			# Interpolacja w zakresie 70% SoC.
 			return 90.0 - ((V_plateau_start - voltage) / V_plateau_drop) * 70.0
 
-	# --- Main Emulation Loop ---
 	def emulation_loop(self):
 		last_emulation_time = time.time()
 		is_sim_discharge = self.sim_discharge_var.get()
 
 		while self.is_running and self.current_voltage > self.config["V_STOP"]:
-			if not self.is_running: break
 
-			# Time synchronization for the loop step
-			time_to_wait = last_emulation_time + TIME_STEP_EMUL_SEC - time.time()
-			if time_to_wait > 0:
-				time.sleep(time_to_wait)
-			last_emulation_time = time.time()
+			if not self.is_running:
+				break
 
 			# 1. CURRENT AND LOGIC DATA MEASUREMENT
 			try:
-				# UNIFIED CALL: Get currents_ma (list of floats) and all_logic_samples (list of lists of bools)
 				currents_ma, all_logic_samples = self.ppk2.get_measurements()
-
-				if not currents_ma:
-					# If no samples, skip this loop iteration
-					continue
-
-				# Get the state of the last sample for GUI indicator
 				logic_data = all_logic_samples[-1] if all_logic_samples else [False] * 8
-
 			except Exception as e:
 				print(f"Error fetching data: {e}")
 				self.is_running = False
 				break
 
-			# 2. CURRENT CALCULATIONS and BATTERY EMULATION
-			currents_ma_np = np.array(currents_ma)
-			I_avg_ma_sampled = np.mean(currents_ma_np)
+			if not currents_ma or len(currents_ma) == 0:
+				time.sleep(0.01)
+				continue
 
-			# Current value scaled by discharge rate for the emulation step
-			I_avg_ma_realtime = I_avg_ma_sampled / DISCHARGE_RATE
+			currents_ma = np.array(currents_ma)
 
-			# Time duration of the simulated step in hours (e.g., 1 second of real time)
+			# --- ENERGY CONSUMPTION LOGIC ---
+
 			time_h_simulated = TIME_STEP_REAL_SEC / 3600.0
+			I_avg_ma_realtime = np.mean(currents_ma)
 
+			# 2. Update time elapsed
 			self.time_elapsed_real_sec += TIME_STEP_REAL_SEC
 
 			if is_sim_discharge:
-				# SIMULATION MODE: Voltage loss is based on target time and SoC curve.
+				# SIMULATED DISCHARGE MODE (LINEAR V-SoC TEST): Capacity loss is time-based (FIXED - linear SoC drop).
+
 				# Calculate the required capacity loss for this step
 				required_mah_loss_step = self.required_mah_loss_per_sec * TIME_STEP_REAL_SEC
 				self.current_capacity_mah -= required_mah_loss_step
+
+				# Calculate SoC (Linear drop)
 				soc_percent = (self.current_capacity_mah / self.config["CAPACITY_NOMINAL_MAH"]) * 100.0
 
-				# Check if we hit the time limit (or V_STOP based on curve)
+				# Calculate Voltage (Linear - follows the linear V-SoC curve for this mode)
+				self.current_voltage = self.get_voltage_from_soc(soc_percent)
+
+				# Check for end condition
 				if self.time_elapsed_real_sec >= self.total_sim_time_sec or soc_percent <= 0:
-					self.current_voltage = self.config["V_STOP"]  # Force V_STOP at end
+					self.current_voltage = self.config["V_STOP"]  # Ensure it hits V_STOP
 					self.is_running = False
-					soc_percent = self.get_soc_percent_from_voltage(self.current_voltage)
-					self.current_capacity_mah = self.config["CAPACITY_NOMINAL_MAH"] * (soc_percent / 100.0)
-				else:
-					self.current_voltage = self.get_voltage_from_soc(soc_percent)
+					break
 
 				# Time remaining calculation (simple countdown)
 				time_remaining_sec = max(0, self.total_sim_time_sec - self.time_elapsed_real_sec)
 
 			else:
-				# REAL EMULATION MODE: Voltage loss is current-based.
+				# REAL EMULATION MODE: Voltage loss is current-based (S-CURVE).
+
 				consumed_mah = I_avg_ma_realtime * time_h_simulated
 				self.current_capacity_mah -= consumed_mah
 				soc_percent = (self.current_capacity_mah / self.config["CAPACITY_NOMINAL_MAH"]) * 100.0
-
-				if soc_percent <= 0:
-					self.current_voltage = self.config["V_STOP"]
-					self.is_running = False
-				else:
-					self.current_voltage = self.get_voltage_from_soc(soc_percent)
+				self.current_voltage = self.get_voltage_from_soc(soc_percent)
 
 				# Estimated remaining time is based on current consumption rate
 				mah_remaining = self.current_capacity_mah - self.config[
@@ -777,165 +763,184 @@ class BatteryEmulator(tk.Frame):
 			self.ppk2.set_voltage(self.current_voltage)
 
 			# 4. Update Logs
-			# Log the current voltage for every sample in this step (assuming all samples in the step share the new voltage)
-			for current_sample in currents_ma:
+
+			for i, current_sample in enumerate(currents_ma):
+				# Log the current voltage for every sample in this step
 				self.all_current_samples.append(current_sample)
 				self.all_time_real_s.append(self.time_elapsed_real_sec)
 				self.all_voltage_v.append(self.current_voltage)
 
-			# Append logic data (list of lists)
-			self.all_logic_data.extend(all_logic_samples)
+				if self.logic_enabled_var.get():
+					self.all_logic_data.append(logic_data)
+				else:
+					self.all_logic_data.append([False] * 8)
 
-			# Calculate statistics for the GUI display from the latest samples
-			peak_current = np.max(currents_ma_np)
-			rms_current = np.sqrt(np.mean(currents_ma_np ** 2))
+			# Calculate statistics
+			peak_current = np.max(currents_ma)
+			rms_current = np.sqrt(np.mean(currents_ma ** 2))
 
 			# --- CONSOLE DEBUG OUTPUT ---
-			# Print every 5 seconds (5 steps of 1s)
-			if int(self.time_elapsed_real_sec) % 5 == 0 or not self.is_running:
+			# Print every 5 seconds (5 steps of 1.0s)
+			if int(self.time_elapsed_real_sec * 10) % 50 == 0 or self.time_elapsed_real_sec == self.total_sim_time_sec:
 				time_rem_str = self.format_seconds_to_hms(time_remaining_sec)
+
 				print(
 					f"TIME: {self.time_elapsed_real_sec:.1f} s | "
 					f"V_OUT: {self.current_voltage:.3f} V | "
 					f"I_AVG: {I_avg_ma_realtime:.2f} mA | "
 					f"SoC: {soc_percent:.1f}% | "
-					f"Linear_Discharge: {self.linear_discharge_var.get()}  | "
 					f"Rem. Time: {time_rem_str}"
+					f" | Linear mode {self.linear_discharge_var.get()}"
 				)
 
 			# Update GUI (Thread-safe way)
 			self.master.after(0, self.update_gui, soc_percent, I_avg_ma_realtime, peak_current, rms_current,
 			                  currents_ma, logic_data)
 
-		# Ensure stop is called when loop finishes
+			# Wait for the next measurement step
+			time.sleep(max(0, TIME_STEP_EMUL_SEC - (time.time() - last_emulation_time)))
+			last_emulation_time = time.time()
+
+		# Final cleanup if loop exited
+		print("--- EMULATION LOOP EXIT ---")
 		self.master.after(0, self.stop_emulation)
+		if self.current_voltage <= self.config["V_STOP"] or is_sim_discharge:
+			self.master.after(0, self.display_final_results)
 
-	# --- GUI Update and Plotting Functions (Retained from original script) ---
-	def update_gui(self, soc_percent, I_avg_ma_realtime, peak_current, rms_current, currents_ma, logic_data):
-		self.v_label.config(text=f"V_SYS Voltage (V): {self.current_voltage:.3f}")
-		self.soc_label.config(text=f"SoC (%): {max(0, soc_percent):.1f} (Avg I: {I_avg_ma_realtime:.2f} mA)")
-
-		runtime_h = self.time_elapsed_real_sec / 3600.0
-		self.runtime_label.config(text=f"Real Runtime (h): {runtime_h:.2f}")
-
-		# Update Logic Indicators
-		if self.logic_enabled_var.get():
-			for i, state in enumerate(logic_data):
-				color = "red" if state else "green"
-				text = f"D{i}: {'HIGH' if state else 'LOW'}"
-				self.logic_indicators[i].config(text=text, foreground=color)
-		else:
-			for indicator in self.logic_indicators:
-				indicator.config(text="D#: ---", foreground="black")
-
-		# Update Statistics
-		self.peak_label.config(text=f"Peak Current (mA): {peak_current:.2f}")
-		self.rms_label.config(text=f"RMS Current (mA): {rms_current:.2f}")
-
-		mode = "TIME SIMULATION" if self.sim_discharge_var.get() else "CURRENT EMULATION"
-		curve_mode = "Linear (Test)" if self.linear_discharge_var.get() else "S-Curve (Real)"
-		self.master.title(f"PPK2 [{API_MODE}] - Battery Simulator ({mode} / {curve_mode})")
-
-		# Update Plot (Only plot last ~1000 samples for performance)
-		plot_limit = 1000
-
-		# Calculate X-axis in seconds (relative to start)
-		time_s = np.array(self.all_time_real_s[-plot_limit:])
-
-		# Current data (all samples are relevant)
-		I_data = np.array(self.all_current_samples[-plot_limit:])
-
-		# Voltage data (all samples are relevant, but voltage is stepped)
-		V_data = np.array(self.all_voltage_v[-plot_limit:])
-
-		self.line_i.set_data(time_s, I_data)
-		self.line_v.set_data(time_s, V_data)
-
-		# Auto-scale X axis
-		self.ax_i.set_xlim(time_s[0], time_s[-1] if time_s.size > 1 else time_s[0] + 1)
-
-		# Auto-scale Y axis (Current)
-		i_max = max(I_data) if I_data.size > 0 and max(I_data) > 0 else BASE_I_PEAK * 1.5
-		i_min = min(I_data) if I_data.size > 0 else 0
-		self.ax_i.set_ylim(i_min * 0.9, i_max * 1.1)
-
-		# Auto-scale Y axis (Voltage)
-		v_min = self.config["V_STOP"]
-		v_max = self.config["V_START"]
-		self.ax_v.set_ylim(v_min * 0.9, v_max * 1.1)
-		self.fig.tight_layout()
-		self.canvas.draw()
-
+	# UPDATED FUNCTION (CORRECTED CHARGE IN COULOMBS)
 	def display_final_results(self):
 		total_time_real_sec = self.time_elapsed_real_sec
 		total_time_real_h = total_time_real_sec / 3600.0
+
 		# Format runtime to HH:MM:SS for the final message
 		runtime_hms = self.format_seconds_to_hms(total_time_real_sec)
 
-		# Re-calculate overall average current from stored logs
-		overall_avg_I_ma = np.mean(self.all_current_samples) if self.all_current_samples else 0.0
-		I_test_avg_ma = overall_avg_I_ma / DISCHARGE_RATE
-
 		if self.sim_discharge_var.get():
-			# In time mode, we calculate the charge loss required to hit V_STOP based on the SoC curve.
-			final_soc = self.get_soc_percent_from_voltage(self.config["V_STOP"])
-			initial_soc = self.get_soc_percent_from_voltage(self.config["V_START"])
-			soc_drop = initial_soc - final_soc
-			mah_consumed_simulated = self.config["CAPACITY_NOMINAL_MAH"] * (soc_drop / 100.0)
+			# In time mode, we simulate the discharge of 100% capacity in a specified time.
+			mah_consumed_simulated = self.config["CAPACITY_NOMINAL_MAH"]
+
 			I_test_avg_ma = mah_consumed_simulated / total_time_real_h if total_time_real_h > 0 else 0
 
+			# proper coulomb conversion (1 mAh = 3.6 C)
+			total_charge_coulombs = mah_consumed_simulated * 3.6
+
 			final_message = (
-				f"!!! SIMULATION FINISHED (Time Mode) !!!\n"
-				f"Curve Mode: {'Linear Slope' if self.linear_discharge_var.get() else 'Real S-Curve'}\n"
-				f"Targeted simulation time: {self.sim_time_str_var.get()} (MM:SS).\n"
-				f"Discharge from {self.config['V_START']:.2f}V to {self.config['V_STOP']:.2f}V achieved.\n"
+				f"!!! SIMULATION FINISHED (Linear V-SoC Test Mode) !!!\n"
+				f"Target Simulation Time: {self.sim_time_str_var.get()} (MM:SS).\n"
+				f"Discharge from {self.config['V_START']:.2f}V to {self.config['V_STOP']:.2f}V reached.\n"
 				f"\n--- RESULTS ---\n"
+				f"Consumed Charge (C): {total_charge_coulombs:.2f} C\n"
 				f"Simulated Runtime: {runtime_hms} (HH:MM:SS)\n"
-				f"Overall Average Current Drawn (PPK2 Samples): {overall_avg_I_ma:.2f} mA\n"
-				f"Overall Average Current Drawn (Emulated/Realtime): {I_test_avg_ma:.2f} mA"
+				f"Theoretical Average Current Drawn: {I_test_avg_ma:.2f} mA (to achieve V drop)"
 			)
+
 		else:
 			total_consumed_mah = self.config["CAPACITY_NOMINAL_MAH"] - self.current_capacity_mah
+
+			# proper conversion (1 mAh = 3.6 C)
+			total_charge_coulombs = total_consumed_mah * 3.6
+
 			I_test_avg_ma = total_consumed_mah / total_time_real_h if total_time_real_h > 0 else 0
-			estimated_runtime_h = self.config["CAPACITY_NOMINAL_MAH"] / I_test_avg_ma if I_test_avg_ma > 0 else float('inf')
+			estimated_runtime_h = self.config["CAPACITY_NOMINAL_MAH"] / I_test_avg_ma if I_test_avg_ma > 0 else float(
+				'inf')
 			estimated_runtime_hms = self.format_seconds_to_hms(estimated_runtime_h * 3600.0)
 
 			final_message = (
 				f"!!! EMULATION FINISHED !!!\n"
-				f"Algorithm reached V_STOP = {self.config['V_STOP']} V.\n"
+				f"The algorithm reached V_STOP = {self.config['V_STOP']} V.\n"
 				f"\n--- TEST RESULTS ---\n"
+				f"Consumed Charge (C): {total_charge_coulombs:.2f} C\n"
 				f"Simulated Runtime until V_STOP: {runtime_hms} (HH:MM:SS)\n"
-				f"Overall Average Current Drawn (PPK2 Samples): {overall_avg_I_ma:.2f} mA\n"
-				f"Overall Average Current Drawn (Emulated/Realtime): {I_test_avg_ma:.2f} mA\n"
+				f"Overall Average Current from test: {I_test_avg_ma:.2f} mA\n"
 				f"*** ESTIMATED TOTAL RUNTIME (Full Capacity): {estimated_runtime_hms} (HH:MM:SS) ***"
 			)
 
-		messagebox.showinfo("Simulation Finished", final_message)
+		messagebox.showinfo("Simulation Results", final_message)
 
+	def update_gui(self, soc_percent, I_avg_ma_realtime, peak_current, rms_current, currents_to_plot, logic_data):
+		# Update Labels
+		self.v_label.config(text=f"V_SYS Voltage (V): {self.current_voltage:.3f}")
+		self.soc_label.config(text=f"SoC (%): {soc_percent:.1f} (Avg I: {I_avg_ma_realtime:.1f} mA)")
+
+		# Display runtime in HH:MM:SS format
+		runtime_hms = self.format_seconds_to_hms(self.time_elapsed_real_sec)
+		self.runtime_label.config(text=f"Real Runtime (H:M:S): {runtime_hms}")
+
+		self.peak_label.config(text=f"Peak Current (mA): {peak_current:.2f}")
+		self.rms_label.config(text=f"RMS Current (mA): {rms_current:.2f}")
+
+		mode = "LINEAR V-SoC TEST" if self.linear_discharge_var.get() else "CURRENT EMULATION (S-Curve)"
+		self.master.title(f"PPK2 [{API_MODE}] - Battery Simulator ({mode})")
+
+		# Update Logic Indicators
+		for i, val in enumerate(logic_data):
+			color = 'green' if val else 'red'
+			text = 'HIGH' if val else 'LOW'
+			self.logic_indicators[i].config(text=f"D{i}: {text}", background=color)
+
+		# Update Plots (Oscilloscope)
+		plot_times = np.arange(0, len(currents_to_plot)) / self.config["SAMPLE_RATE_HZ"]
+
+		# Current Plot
+		self.line_i.set_data(plot_times, currents_to_plot)
+		self.ax_i.set_xlim(0, plot_times[-1] if plot_times.size > 0 else 0.01)
+		self.ax_i.set_ylim(np.min(currents_to_plot) * 0.9,
+		                   np.max(currents_to_plot) * 1.1 if currents_to_plot.size > 0 else 10)
+
+		# Voltage Plot
+		voltage_plot = np.full_like(plot_times, self.current_voltage)
+		self.line_v.set_data(plot_times, voltage_plot)
+		self.ax_v.set_ylim(self.config["V_STOP"] * 0.9, self.config["V_START"] * 1.1)
+
+		self.fig.tight_layout()
+		self.canvas.draw()
+
+	#
 	def save_data(self):
-		filepath = filedialog.asksaveasfilename(
-			defaultextension=".csv",
-			filetypes=[("CSV files", "*.csv")],
-			initialfile=f"ppk2_batt_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-		)
+		"""Saves collected data to a CSV file and appends summary statistics.
+		   Includes an aggregated Hex value for the Logic Analyzer pins."""
+		if not self.all_current_samples:
+			messagebox.showwarning("Error", "No data to save.")
+			return
 
+		# --- Generate File Name with Date/Time ---
+		timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+		default_filename = f"{timestamp}_ppk2_battery_log.csv"
+
+		filepath = filedialog.asksaveasfilename(defaultextension=".csv",
+		                                        filetypes=[("CSV files", "*.csv")],
+		                                        initialfile=default_filename)
 		if not filepath:
 			return
 
-		# --- 1. Get Log Time Data (Time in s:ms format for consistency) ---
-		time_s_ms = []
-		for t_s in self.all_time_real_s:
-			s = int(t_s)
-			ms = int((t_s - s) * 1000)
-			time_s_ms.append(f"{s}:{ms:03d}")
+		# --- 1. Prepare Time Data in s:ms format ---
+		def format_time_s_ms(total_seconds):
+			seconds = int(total_seconds)
+			milliseconds = int(round((total_seconds - seconds) * 1000))
+			if milliseconds == 1000:  # Handle rounding up to the next second
+				seconds += 1
+				milliseconds = 0
+			return f"{seconds}:{milliseconds:03d}"
 
-		# --- 2. Logic Data Conversion Helper (Function to convert list of bools to Hex) ---
+		time_s_ms = [format_time_s_ms(t) for t in self.all_time_real_s]
+
+		# --- 2. Bit-to-Hex Conversion ---
 		def logic_to_hex(logic_list):
+			"""
+			Converts a list of 8 booleans (D0 is LSB) to a 0xXX hex string.
+			Now prepends '0x' for standard hex format.
+			"""
+			if not logic_list:
+				return '0x00'
+
+			logic_list = logic_list[:8] + [False] * (8 - len(logic_list))
+
+			# Assuming D0 is LSB (2^0) and D7 is MSB (2^7).
 			decimal_value = 0
-			# D0 is the least significant bit (index 0)
 			for i, state in enumerate(logic_list):
 				if state:
 					decimal_value += (2 ** i)
+
 			# Return with '0x' prefix
 			return f'0x{decimal_value:02X}'
 
@@ -960,59 +965,47 @@ class BatteryEmulator(tk.Frame):
 		# --- 4. Calculate Summary Statistics ---
 		total_time_real_sec = self.time_elapsed_real_sec
 		total_time_real_h = total_time_real_sec / 3600.0
+
+		# Format runtime to HH:MM:SS for the summary
 		runtime_hms = self.format_seconds_to_hms(total_time_real_sec)
 
-		# Calculate overall average/rms/peak from all collected samples (not just the last step)
-		all_currents_np = np.array(self.all_current_samples)
-		I_avg_ma = np.mean(all_currents_np) if all_currents_np.size > 0 else 0.0
-		I_rms_ma = np.sqrt(np.mean(all_currents_np ** 2)) if all_currents_np.size > 0 else 0.0
-		I_peak_ma = np.max(all_currents_np) if all_currents_np.size > 0 else 0.0
-
 		if self.sim_discharge_var.get():
-			# Time Simulation Mode
-			# In time mode, we calculate the charge loss required to hit V_STOP based on the SoC curve.
-			final_soc = self.get_soc_percent_from_voltage(self.config["V_STOP"])
-			initial_soc = self.get_soc_percent_from_voltage(self.config["V_START"])
-			soc_drop = initial_soc - final_soc
-			mah_consumed_simulated = self.config["CAPACITY_NOMINAL_MAH"] * (soc_drop / 100.0)
-			I_test_avg_ma_realtime = mah_consumed_simulated / total_time_real_h if total_time_real_h > 0 else 0
+			# Time Simulation Mode (Linear V-SoC Test) - Total capacity used
+			mah_consumed_simulated = self.config["CAPACITY_NOMINAL_MAH"]
+
+			I_avg_ma = mah_consumed_simulated / total_time_real_h if total_time_real_h > 0 else 0
 			I_peak_ma = np.max(self.all_current_samples) if self.all_current_samples else 0
 
-			total_coulomb_uAh = mah_consumed_simulated * 1000
+			total_charge_coulombs = mah_consumed_simulated * 3.6
 			estimated_runtime_hms = self.format_seconds_to_hms(self.total_sim_time_sec)
-			runtime_status = f"Targeted Runtime (H:M:S): {estimated_runtime_hms}"
 
 		else:
-			# Current Emulation Mode
+			# Current Emulation Mode (S-Curve)
 			total_consumed_mah = self.config["CAPACITY_NOMINAL_MAH"] - self.current_capacity_mah
+
+			total_charge_coulombs = total_consumed_mah * 3.6
+
 			I_avg_ma = total_consumed_mah / total_time_real_h if total_time_real_h > 0 else 0
 			I_peak_ma = np.max(self.all_current_samples) if self.all_current_samples else 0
 
-			total_coulomb_uAh = total_consumed_mah * 1000
 			estimated_runtime_h = self.config["CAPACITY_NOMINAL_MAH"] / I_avg_ma if I_avg_ma > 0 else float('inf')
 			estimated_runtime_hms = self.format_seconds_to_hms(estimated_runtime_h * 3600.0)
-			runtime_status = f"Estimated Total Runtime (H:M:S): {estimated_runtime_hms}"
 
 		# --- 5. Create Summary Block ---
 		summary_lines = [
-			"--------------------------",
-			"--- EMULATION SUMMARY ---",
-			f"API_Mode,{API_MODE}",
-			f"Curve_Mode,{'LINEAR_SLOPE_TEST' if self.linear_discharge_var.get() else 'REAL_S_CURVE'}",
+			f"\n\n--- SIMULATION SUMMARY ---",
+			f"Mode,{'LINEAR_V_SOC_TEST' if self.sim_discharge_var.get() else 'CURRENT_EMULATION_S_CURVE'}",
 			f"Battery_Type,{self.battery_type_var.get()}",
-			f"Capacity_mAh,{self.config['CAPACITY_NOMINAL_MAH']}",
-			f"Discharge_Mode,{'Time Simulation' if self.sim_discharge_var.get() else 'Current Emulation'}",
-			f"Logic_Enabled,{self.logic_enabled_var.get()}",
-			f"Spike_Filtering_Enabled,{self.spike_filtering_var.get()}",
-			f"Avg_Current_mA_Realtime,{I_test_avg_ma_realtime:.2f}",
-			f"Avg_Current_mA_PPK2_Sampled,{I_avg_ma:.2f}",
-			f"RMS_Current_mA,{I_rms_ma:.2f}",
+			f"Nominal_Capacity_mAh,{self.config['CAPACITY_NOMINAL_MAH']:.2f}",
+			f"Time_to_V_STOP_s,{self.time_elapsed_real_sec:.2f}",
+			f"Total_Charge_Consumed_C,{total_charge_coulombs:.2f}",
+			f"Average_Current_mA,{I_avg_ma:.2f}",
 			f"Peak_Current_mA,{I_peak_ma:.2f}",
 			f"Runtime_to_V_STOP_H:M:S,{runtime_hms}",  # Use H:M:S format here
 			f"Estimated_Total_Runtime_H:M:S,{estimated_runtime_hms}",
 			f"V_START_V,{self.config['V_START']:.2f}",
 			f"V_STOP_V,{self.config['V_STOP']:.2f}",
-			"--------------------------"
+			f"--------------------------"
 		]
 		summary_block = "\n".join(summary_lines)
 
